@@ -5,12 +5,18 @@ This script demonstrates how to use the InputProperties, workflow, and
 analysis modules to perform composite laminate analysis.
 """
 
-from InputProperties import (
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.InputProperties import (
     create_standard_QI_8ply, create_standard_QI_16ply,
     create_standard_QI_with_temperature, MaterialProperties, 
     LayupSequence, LaminateProperties
 )
-from workflow import LaminateAnalysis, run_standard_QI_analysis
+from src.workflow import LaminateAnalysis, run_standard_QI_analysis
 
 
 def example_1_standard_8ply_qi():

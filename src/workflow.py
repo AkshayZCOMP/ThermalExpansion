@@ -6,12 +6,12 @@ stiffness matrices, thermal effects, and resulting strains.
 """
 
 import numpy as np
-from MatrixFunctions import (
+from .MatrixFunctions import (
     Q_matrix, CTE_vetor, T_matrix, reuters_matrix, Q_bar, alpha_bar,
     A_matrix, B_matrix, D_matrix, arrange_ABD,
     N_thermal, M_thermal, resultantvector
 )
-from InputProperties import LaminateProperties
+from .InputProperties import LaminateProperties
 
 
 class LaminateAnalysis:

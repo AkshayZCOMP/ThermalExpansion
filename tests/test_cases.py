@@ -10,14 +10,20 @@ Comprehensive test suite for laminate analysis including:
 """
 
 import unittest
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import numpy as np
-from InputProperties import (
+from src.InputProperties import (
     MaterialProperties, LayupSequence, LaminateProperties,
     create_standard_QI_8ply, create_standard_QI_16ply, 
     create_standard_QI_with_temperature
 )
-from workflow import LaminateAnalysis, run_standard_QI_analysis
-from MatrixFunctions import (
+from src.workflow import LaminateAnalysis, run_standard_QI_analysis
+from src.MatrixFunctions import (
     Q_matrix, T_matrix, reuters_matrix, Q_bar, alpha_bar
 )
 

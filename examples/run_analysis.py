@@ -4,9 +4,15 @@ COMPOSITE LAMINATE ANALYSIS - MAIN RUNNER
 Edit the configuration section below and run this script.
 """
 
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 import numpy as np
-from InputProperties import MaterialProperties, LayupSequence, LaminateProperties
-from workflow import LaminateAnalysis
+from src.InputProperties import MaterialProperties, LayupSequence, LaminateProperties
+from src.workflow import LaminateAnalysis
 
 # ============================================================================
 # CONFIGURATION - EDIT HERE
