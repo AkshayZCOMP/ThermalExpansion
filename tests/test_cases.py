@@ -26,6 +26,9 @@ from src.workflow import LaminateAnalysis, run_standard_QI_analysis
 from src.MatrixFunctions import (
     Q_matrix, T_matrix, reuters_matrix, Q_bar, alpha_bar
 )
+from src.ThermalDiffusion import (
+    ThermalDiffusion, ThermalDiffusionAnalyzer
+)
 
 
 class TestMaterialProperties(unittest.TestCase):
@@ -582,6 +585,316 @@ class TestNumericalStability(unittest.TestCase):
             self.assertFalse(np.any(np.isnan(strain)))
 
 
+class TestThermalDiffusion(unittest.TestCase):
+    """Tests for thermal diffusion module."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.laminate = create_standard_QI_8ply()
+        self.analysis = LaminateAnalysis(self.laminate)
+        self.analysis.run_full_analysis()
+    
+    def test_thermal_diffusion_initialization(self):
+        """Test ThermalDiffusion initialization."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-6,
+            n_nodes=50
+        )
+        
+        self.assertEqual(td.top_temp, 100)
+        self.assertEqual(td.initial_temp, 20)
+        self.assertEqual(td.alpha, 1e-6)
+        self.assertEqual(td.n_nodes, 50)
+        self.assertEqual(len(td.z), 50)
+    
+    def test_spatial_grid_creation(self):
+        """Test that spatial grid is properly created."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            n_nodes=30
+        )
+        
+        # Grid should start at 0 and end at thickness
+        self.assertAlmostEqual(td.z[0], 0)
+        self.assertAlmostEqual(td.z[-1], self.laminate.total_thickness)
+        
+        # Grid spacing should be uniform
+        dz_expected = self.laminate.total_thickness / (30 - 1)
+        np.testing.assert_array_almost_equal(np.diff(td.z), np.ones(29) * dz_expected)
+    
+    def test_transient_analysis_runs(self):
+        """Test that transient analysis runs without errors."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-5,  # High diffusivity for fast test
+            n_nodes=30
+        )
+        
+        # Use very short time scale for testing
+        results = td.solve_transient(t_final=1.0, n_steps=10)
+        
+        self.assertIsNotNone(results)
+        self.assertIn('t', results)
+        self.assertIn('z', results)
+        self.assertIn('T', results)
+        self.assertIn('strains', results)
+        self.assertIn('curvatures', results)
+    
+    def test_temperature_boundary_conditions(self):
+        """Test that boundary conditions are applied correctly."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-5,
+            n_nodes=30
+        )
+        
+        results = td.solve_transient(t_final=1.0, n_steps=10)
+        T = results['T']
+        
+        # Top surface should be at imposed temperature
+        np.testing.assert_array_almost_equal(T[:, 0], np.ones(10) * 100)
+    
+    def test_temperature_evolution(self):
+        """Test that temperature evolves from initial to boundary condition."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-4,  # Very high for rapid diffusion
+            n_nodes=50
+        )
+        
+        results = td.solve_transient(t_final=10.0, n_steps=20)
+        T = results['T']
+        
+        # Temperature at interior should increase over time
+        mid_idx = len(T[0]) // 2
+        T_mid_initial = T[0, mid_idx]
+        T_mid_final = T[-1, mid_idx]
+        
+        # Final temperature should be higher than initial at mid-point
+        self.assertGreater(T_mid_final, T_mid_initial)
+    
+    def test_strain_calculation_from_profile(self):
+        """Test strain calculation from temperature profile."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-5,
+            n_nodes=30
+        )
+        
+        # Create a simple temperature profile
+        T_profile = np.linspace(20, 100, 30)  # Linear gradient
+        
+        strains, curvatures = td._compute_strains_from_profile(T_profile)
+        
+        self.assertEqual(strains.shape, (3,))
+        self.assertEqual(curvatures.shape, (3,))
+        
+        # Strains should be nonzero due to thermal loading
+        self.assertFalse(np.allclose(strains, np.zeros(3)))
+    
+    def test_steady_state_properties(self):
+        """Test retrieval of steady state properties."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-4,
+            n_nodes=30
+        )
+        
+        td.solve_transient(t_final=5.0, n_steps=15)
+        
+        steady = td.get_steady_state_properties()
+        
+        self.assertIn('T', steady)
+        self.assertIn('strains', steady)
+        self.assertIn('curvatures', steady)
+        self.assertIn('avg_temp', steady)
+        self.assertIn('max_temp', steady)
+        self.assertIn('min_temp', steady)
+        
+        # Max temp should be at or near top surface
+        self.assertAlmostEqual(steady['max_temp'], 100, places=1)
+        
+        # Min temp should be at or near initial
+        self.assertAlmostEqual(steady['min_temp'], 20, places=1)
+    
+    def test_temperature_gradient(self):
+        """Test temperature gradient calculation."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-4,
+            n_nodes=50
+        )
+        
+        td.solve_transient(t_final=5.0, n_steps=15)
+        
+        dT_dz = td.get_temperature_gradient()
+        
+        self.assertEqual(dT_dz.shape, (50,))
+        
+        # Gradient should be nonzero (not uniform temperature)
+        self.assertGreater(np.max(np.abs(dT_dz)), 0)
+    
+    def test_time_to_steady_state(self):
+        """Test time to steady state detection."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=20,
+            thermal_diffusivity=1e-4,
+            n_nodes=30
+        )
+        
+        td.solve_transient(t_final=10.0, n_steps=50)
+        
+        t_ss = td.time_to_steady_state(tolerance=0.05)
+        
+        # Time to steady state should be positive and less than total time
+        self.assertGreater(t_ss, 0)
+        self.assertLess(t_ss, 10.0)
+
+
+class TestThermalDiffusionAnalyzer(unittest.TestCase):
+    """Tests for ThermalDiffusionAnalyzer high-level interface."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.laminate = create_standard_QI_8ply()
+    
+    def test_analyzer_initialization(self):
+        """Test ThermalDiffusionAnalyzer initialization."""
+        analyzer = ThermalDiffusionAnalyzer(
+            self.laminate,
+            top_surface_temp=100,
+            initial_temp=20
+        )
+        
+        self.assertEqual(analyzer.top_temp, 100)
+        self.assertEqual(analyzer.initial_temp, 20)
+        self.assertIsNone(analyzer.analysis)
+        self.assertIsNone(analyzer.thermal_diffusion)
+        self.assertIsNone(analyzer.results)
+    
+    def test_analyze_method(self):
+        """Test that analyze method runs complete analysis."""
+        analyzer = ThermalDiffusionAnalyzer(
+            self.laminate,
+            top_surface_temp=100,
+            initial_temp=20
+        )
+        
+        results = analyzer.analyze(
+            t_final=1.0,
+            n_steps=10,
+            n_nodes=30,
+            thermal_diffusivity=1e-4
+        )
+        
+        self.assertIsNotNone(results)
+        self.assertIsNotNone(analyzer.analysis)
+        self.assertIsNotNone(analyzer.thermal_diffusion)
+        self.assertIsNotNone(analyzer.results)
+    
+    def test_results_structure(self):
+        """Test that results have expected structure."""
+        analyzer = ThermalDiffusionAnalyzer(
+            self.laminate,
+            top_surface_temp=100,
+            initial_temp=20
+        )
+        
+        results = analyzer.analyze(
+            t_final=2.0,
+            n_steps=15,
+            thermal_diffusivity=1e-4
+        )
+        
+        # Check results keys
+        expected_keys = ['t', 'z', 'T', 'strains', 'curvatures']
+        for key in expected_keys:
+            self.assertIn(key, results)
+        
+        # Check array shapes
+        n_steps = 15
+        n_nodes = 50
+        
+        self.assertEqual(len(results['t']), n_steps)
+        self.assertEqual(len(results['z']), n_nodes)
+        self.assertEqual(results['T'].shape, (n_steps, n_nodes))
+        self.assertEqual(results['strains'].shape, (n_steps, 3))
+        self.assertEqual(results['curvatures'].shape, (n_steps, 3))
+    
+    def test_transient_behavior_visible(self):
+        """Test that transient behavior is visible with fast diffusivity."""
+        analyzer = ThermalDiffusionAnalyzer(
+            self.laminate,
+            top_surface_temp=80,
+            initial_temp=20
+        )
+        
+        # Use very high diffusivity to see rapid changes
+        results = analyzer.analyze(
+            t_final=10.0,
+            n_steps=50,
+            thermal_diffusivity=1e-3  # Very fast
+        )
+        
+        # Temperature should change significantly
+        T_initial_avg = np.mean(results['T'][0, :])
+        T_final_avg = np.mean(results['T'][-1, :])
+        
+        self.assertGreater(T_final_avg, T_initial_avg)
+        
+        # Strains should evolve
+        strain_initial = results['strains'][0, 0]
+        strain_final = results['strains'][-1, 0]
+        
+        self.assertNotAlmostEqual(strain_initial, strain_final, places=8)
+    
+    def test_different_diffusivity_speeds(self):
+        """Test that lower diffusivity results in slower change."""
+        laminate = self.laminate
+        
+        # High diffusivity
+        analyzer_fast = ThermalDiffusionAnalyzer(laminate, 100, 20)
+        results_fast = analyzer_fast.analyze(t_final=1.0, n_steps=10, thermal_diffusivity=1e-3)
+        
+        # Low diffusivity
+        analyzer_slow = ThermalDiffusionAnalyzer(laminate, 100, 20)
+        results_slow = analyzer_slow.analyze(t_final=1.0, n_steps=10, thermal_diffusivity=1e-5)
+        
+        # At same time, fast should have higher average temperature
+        T_avg_fast = np.mean(results_fast['T'][-1, :])
+        T_avg_slow = np.mean(results_slow['T'][-1, :])
+        
+        self.assertGreater(T_avg_fast, T_avg_slow)
+
+
 def run_all_tests():
     """Run all tests and generate a report."""
     loader = unittest.TestLoader()
@@ -601,6 +914,8 @@ def run_all_tests():
     suite.addTests(loader.loadTestsFromTestCase(TestFullWorkflow))
     suite.addTests(loader.loadTestsFromTestCase(TestEdgeCases))
     suite.addTests(loader.loadTestsFromTestCase(TestNumericalStability))
+    suite.addTests(loader.loadTestsFromTestCase(TestThermalDiffusion))
+    suite.addTests(loader.loadTestsFromTestCase(TestThermalDiffusionAnalyzer))
     
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

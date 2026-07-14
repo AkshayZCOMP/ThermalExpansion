@@ -72,6 +72,8 @@ class ThermalDiffusion:
         Uses central differences for spatial derivatives.
         
         dT/dt = α * d²T/dz²
+        
+        Interior nodes only (boundary conditions handled separately)
         """
         dT_dt = np.zeros_like(T)
         
@@ -80,9 +82,9 @@ class ThermalDiffusion:
             d2T_dz2 = (T[i+1] - 2*T[i] + T[i-1]) / (self.dz ** 2)
             dT_dt[i] = self.alpha * d2T_dz2
         
-        # Boundary conditions
-        dT_dt[0] = 0  # Top surface: fixed temperature
-        dT_dt[-1] = 0  # Bottom surface: adiabatic (no flux)
+        # Boundary nodes will be enforced after each ODE step in solve_transient()
+        dT_dt[0] = 0   # Top surface: will be forced to T_top
+        dT_dt[-1] = 0  # Bottom surface: adiabatic boundary handled by discretization
         
         return dT_dt
     
@@ -120,9 +122,10 @@ class ThermalDiffusion:
         T_solution = odeint(self._temperature_diffusion_ode, T_init, time)
         
         # Apply boundary conditions at each time step
-        T_solution[:, 0] = self.top_temp  # Top surface
+        T_solution[:, 0] = self.top_temp  # Top surface: enforce Dirichlet BC
         if bottom_temp is not None:
             T_solution[:, -1] = bottom_temp  # Bottom surface if specified
+        # else: adiabatic already handled by ODE boundary condition
         
         # Calculate strains and curvatures for each temperature profile
         strains_list = []

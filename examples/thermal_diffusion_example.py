@@ -40,16 +40,17 @@ LAYUP = [0, 45, -45, 90, 90, -45, 45, 0]  # 8-ply QI layup
 # Thermal Boundary Conditions
 INITIAL_TEMP = 20          # Initial uniform temperature throughout (°C or K)
 TOP_SURFACE_TEMP = 100     # Temperature imposed at top surface (°C or K)
-ANALYSIS_TIME = 3600       # Total analysis time (seconds, 1 hour)
-N_TIME_STEPS = 200         # Number of time steps for transient analysis
+ANALYSIS_TIME = 10         # Total analysis time (seconds) - SHORT for visible changes!
+N_TIME_STEPS = 100         # Number of time steps (0.1 sec per step)
 N_SPATIAL_NODES = 50       # Number of nodes through thickness
 
 # Material Thermal Properties
-THERMAL_DIFFUSIVITY = 1e-6 # Thermal diffusivity α = k/(ρ*c) in m²/s
-                            # Typical values:
+THERMAL_DIFFUSIVITY = 1e-3 # Thermal diffusivity α = k/(ρ*c) in m²/s
+                            # INCREASED for visible transient effects!
+                            # Real values (use these for realistic):
                             # - Carbon/Epoxy: 1e-6 to 2e-6 m²/s
                             # - Glass/Epoxy: 0.5e-6 to 1.5e-6 m²/s
-                            # - Aluminum: 7e-5 m²/s
+                            # - We use 1e-3 to see transient in 10 seconds
 
 # ============================================================================
 # RUN THERMAL DIFFUSION ANALYSIS
