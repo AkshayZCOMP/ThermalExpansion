@@ -23,8 +23,12 @@ from .MatrixFunctions import (
     N_thermal,
     M_thermal
 )
+from .ThermalDiffusion import (
+    ThermalDiffusion,
+    ThermalDiffusionAnalyzer
+)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Akshay"
 
 __all__ = [
@@ -43,5 +47,7 @@ __all__ = [
     "B_matrix",
     "D_matrix",
     "N_thermal",
-    "M_thermal"
+    "M_thermal",
+    "ThermalDiffusion",
+    "ThermalDiffusionAnalyzer"
 ]
