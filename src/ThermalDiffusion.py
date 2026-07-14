@@ -14,8 +14,6 @@ Where:
 """
 
 import numpy as np
-from scipy.sparse import diags, csr_matrix
-from scipy.integrate import odeint
 
 
 class ThermalDiffusion:
@@ -65,6 +63,7 @@ class ThermalDiffusion:
         self.time_history = []
         self.strain_history = []
         self.curvature_history = []
+        self._bottom_temp = None
         
     def _temperature_diffusion_ode(self, T, t):
         """
@@ -76,15 +75,23 @@ class ThermalDiffusion:
         Interior nodes only (boundary conditions handled separately)
         """
         dT_dt = np.zeros_like(T)
-        
+
+        T_work = T.copy()
+        T_work[0] = self.top_temp
+        if self._bottom_temp is not None:
+            T_work[-1] = self._bottom_temp
+
         # Interior nodes: central difference
         for i in range(1, len(T) - 1):
-            d2T_dz2 = (T[i+1] - 2*T[i] + T[i-1]) / (self.dz ** 2)
+            d2T_dz2 = (T_work[i+1] - 2*T_work[i] + T_work[i-1]) / (self.dz ** 2)
             dT_dt[i] = self.alpha * d2T_dz2
         
-        # Boundary nodes will be enforced after each ODE step in solve_transient()
-        dT_dt[0] = 0   # Top surface: will be forced to T_top
-        dT_dt[-1] = 0  # Bottom surface: adiabatic boundary handled by discretization
+        dT_dt[0] = 0
+        if self._bottom_temp is None:
+            d2T_dz2 = 2 * (T_work[-2] - T_work[-1]) / (self.dz ** 2)
+            dT_dt[-1] = self.alpha * d2T_dz2
+        else:
+            dT_dt[-1] = 0
         
         return dT_dt
     
@@ -112,37 +119,34 @@ class ThermalDiffusion:
             - 'total_strains': total strains including thermal [n_steps, 3]
             - 'total_curvatures': total curvatures including thermal [n_steps, 3]
         """
-        # Initial condition: uniform temperature
+        self._bottom_temp = bottom_temp
+        self.T_history = []
+        self.time_history = []
+        self.strain_history = []
+        self.curvature_history = []
+
+        # Initial condition: sudden surface-temperature exposure at t=0.
         T_init = np.ones(self.n_nodes) * self.initial_temp
+        T_init[0] = self.top_temp
+        if bottom_temp is not None:
+            T_init[-1] = bottom_temp
         
         # Time array
         time = np.linspace(0, t_final, n_steps)
         
-        # Solve ODE system
-        T_solution = odeint(self._temperature_diffusion_ode, T_init, time)
+        # Solve the diffusion equation with backward Euler. This remains stable
+        # for the small laminate time scales and high diffusivities used here.
+        T_solution = self._solve_temperature_implicit(T_init, time, bottom_temp)
         
-        # Apply boundary conditions at each time step
+        # Re-apply boundary conditions at each time step to remove solver drift.
         T_solution[:, 0] = self.top_temp  # Top surface: enforce Dirichlet BC
         if bottom_temp is not None:
             T_solution[:, -1] = bottom_temp  # Bottom surface if specified
-        # else: adiabatic already handled by ODE boundary condition
         
         # Calculate strains and curvatures for each temperature profile
         strains_list = []
         curvatures_list = []
-        total_strains_list = []
-        total_curvatures_list = []
-        
         for i, T_profile in enumerate(T_solution):
-            # Average temperature through thickness
-            T_avg = np.mean(T_profile)
-            
-            # Create modified laminate with current average temperature
-            # This represents the thermal loading
-            T_diff_avg = T_avg - self.initial_temp
-            
-            # Calculate thermal strains due to temperature distribution
-            # We need to integrate through thickness considering each ply
             strains, curvatures = self._compute_strains_from_profile(T_profile)
             
             strains_list.append(strains)
@@ -165,6 +169,51 @@ class ThermalDiffusion:
             'strains': np.array(strains_list),
             'curvatures': np.array(curvatures_list),
         }
+
+    def _solve_temperature_implicit(self, T_init, time, bottom_temp=None):
+        T_solution = np.zeros((len(time), self.n_nodes))
+        T_solution[0] = T_init
+
+        for step in range(1, len(time)):
+            dt = time[step] - time[step - 1]
+            previous = T_solution[step - 1]
+
+            if bottom_temp is None:
+                unknown_count = self.n_nodes - 1
+            else:
+                unknown_count = self.n_nodes - 2
+
+            matrix = np.zeros((unknown_count, unknown_count))
+            rhs = previous[1:1 + unknown_count].copy()
+            r = self.alpha * dt / (self.dz ** 2)
+
+            for row in range(unknown_count):
+                node = row + 1
+                matrix[row, row] = 1 + 2 * r
+
+                if node - 1 == 0:
+                    rhs[row] += r * self.top_temp
+                else:
+                    matrix[row, row - 1] = -r
+
+                if node + 1 == self.n_nodes - 1 and bottom_temp is not None:
+                    rhs[row] += r * bottom_temp
+                elif node + 1 == self.n_nodes:
+                    if bottom_temp is None:
+                        matrix[row, row] = 1 + 2 * r
+                        matrix[row, row - 1] = -2 * r
+                elif row + 1 < unknown_count:
+                    matrix[row, row + 1] = -r
+
+            T_new = np.empty(self.n_nodes)
+            T_new[0] = self.top_temp
+            T_new[1:1 + unknown_count] = np.linalg.solve(matrix, rhs)
+            if bottom_temp is not None:
+                T_new[-1] = bottom_temp
+
+            T_solution[step] = T_new
+
+        return T_solution
     
     def _compute_strains_from_profile(self, T_profile):
         """
@@ -174,41 +223,44 @@ class ThermalDiffusion:
         - Ply-by-ply temperature variation
         - CTE mismatch between fiber and matrix directions
         """
-        # Interpolate temperature for each ply at its mid-thickness position
-        ply_mids = np.cumsum([0] + [self.laminate.ply_thickness] * len(self.laminate.layup.angles))
-        ply_mids = (ply_mids[:-1] + ply_mids[1:]) / 2  # Midpoints
-        ply_temps = np.interp(ply_mids, self.z, T_profile)
-        
-        # Temperature deviations for each ply
-        ply_dTs = ply_temps - self.initial_temp
-        
-        # Average temperature change for overall thermal loading
-        T_avg = np.mean(T_profile)
-        delta_T_avg = T_avg - self.initial_temp
-        
-        # Use existing analysis engine with average temperature
-        # Create temporary laminate property with this delta_T
-        from .InputProperties import LaminateProperties
-        temp_laminate = LaminateProperties(
-            material=self.laminate.material,
-            layup=self.laminate.layup,
-            ply_thickness=self.laminate.ply_thickness,
-            delta_T=delta_T_avg
+        if not self.analysis.Q_bar_list or not self.analysis.alpha_bar_list:
+            self.analysis.calculate_transformed_matrices()
+        if self.analysis.ABD_matrix is None:
+            self.analysis.calculate_laminate_stiffness_matrices()
+
+        ply_count = self.laminate.layup.num_plies
+        ply_thickness = self.laminate.ply_thickness
+        h = self.thickness
+        z_bottom = -h / 2
+
+        N_thermal = np.zeros(3)
+        M_thermal = np.zeros(3)
+
+        for i in range(ply_count):
+            z_i = z_bottom + i * ply_thickness
+            z_ip1 = z_i + ply_thickness
+            z_mech = np.linspace(z_i, z_ip1, 5)
+
+            # Mechanical z is centered on the laminate; thermal z starts at
+            # the heated top surface and increases toward the bottom surface.
+            z_thermal = h / 2 - z_mech
+            delta_T = np.interp(z_thermal, self.z, T_profile) - self.initial_temp
+
+            thermal_stress_per_degree = (
+                self.analysis.Q_bar_list[i] @ self.analysis.alpha_bar_list[i]
+            )
+            N_thermal += thermal_stress_per_degree * np.trapezoid(delta_T, z_mech)
+            M_thermal += thermal_stress_per_degree * np.trapezoid(delta_T * z_mech, z_mech)
+
+        resultant = np.linalg.inv(self.analysis.ABD_matrix) @ np.concatenate(
+            (N_thermal, M_thermal)
         )
-        
-        # Quick recalculation with this temperature
-        from .workflow import LaminateAnalysis
-        temp_analysis = LaminateAnalysis(temp_laminate)
-        temp_analysis.calculate_material_matrices()
-        temp_analysis.calculate_transformed_matrices()
-        temp_analysis.calculate_laminate_stiffness_matrices()
-        temp_analysis.calculate_thermal_loading()
-        temp_analysis.calculate_resultant_strains()
-        
-        strains = temp_analysis.resultant_strains[:3]  # Membrane strains
-        curvatures = temp_analysis.resultant_strains[3:]  # Curvatures
-        
-        return strains, curvatures
+
+        return resultant[:3], resultant[3:]
+
+    def estimate_diffusion_time_scale(self):
+        """Return h^2 / alpha, the characteristic through-thickness diffusion time."""
+        return self.thickness ** 2 / self.alpha
     
     def get_steady_state_properties(self):
         """Get steady state temperature profile and resulting strains/curvatures."""
@@ -269,7 +321,8 @@ class ThermalDiffusionAnalyzer:
     High-level interface for transient thermal analysis with strain calculation.
     """
     
-    def __init__(self, laminate_properties, top_surface_temp=50, initial_temp=20):
+    def __init__(self, laminate_properties, top_surface_temp=50, initial_temp=20,
+                 bottom_surface_temp=None):
         """
         Initialize analyzer.
         
@@ -285,11 +338,13 @@ class ThermalDiffusionAnalyzer:
         self.laminate = laminate_properties
         self.top_temp = top_surface_temp
         self.initial_temp = initial_temp
+        self.bottom_temp = bottom_surface_temp
         self.analysis = None
         self.thermal_diffusion = None
         self.results = None
     
-    def analyze(self, t_final=3600, n_steps=100, n_nodes=50, thermal_diffusivity=1e-6):
+    def analyze(self, t_final=None, n_steps=100, n_nodes=50, thermal_diffusivity=1e-6,
+                bottom_surface_temp=None):
         """
         Run complete thermal diffusion analysis.
         
@@ -323,7 +378,13 @@ class ThermalDiffusionAnalyzer:
             n_nodes=n_nodes
         )
         
-        self.results = self.thermal_diffusion.solve_transient(t_final, n_steps)
+        if t_final is None:
+            t_final = 2.0 * self.thermal_diffusion.estimate_diffusion_time_scale()
+
+        bottom_temp = self.bottom_temp if bottom_surface_temp is None else bottom_surface_temp
+        self.results = self.thermal_diffusion.solve_transient(
+            t_final, n_steps, bottom_temp=bottom_temp
+        )
         return self.results
     
     def plot_temperature_evolution(self, figsize=(12, 5)):

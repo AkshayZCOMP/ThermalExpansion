@@ -736,8 +736,9 @@ class TestThermalDiffusion(unittest.TestCase):
         # Max temp should be at or near top surface
         self.assertAlmostEqual(steady['max_temp'], 100, places=1)
         
-        # Min temp should be at or near initial
-        self.assertAlmostEqual(steady['min_temp'], 20, places=1)
+        # With an adiabatic bottom and a long solve, the laminate approaches
+        # the imposed top-surface temperature throughout the thickness.
+        self.assertAlmostEqual(steady['min_temp'], 100, places=1)
     
     def test_temperature_gradient(self):
         """Test temperature gradient calculation."""
@@ -774,9 +775,52 @@ class TestThermalDiffusion(unittest.TestCase):
         
         t_ss = td.time_to_steady_state(tolerance=0.05)
         
-        # Time to steady state should be positive and less than total time
-        self.assertGreater(t_ss, 0)
+        # Time to steady state should be within the analyzed interval. For very
+        # fast diffusion it may be reached before the first positive output time.
+        self.assertGreaterEqual(t_ss, 0)
         self.assertLess(t_ss, 10.0)
+
+    def test_bottom_surface_temperature_boundary_condition(self):
+        """Test fixed hot top and room-temperature bottom boundary conditions."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=25,
+            thermal_diffusivity=1e-6,
+            n_nodes=40
+        )
+
+        results = td.solve_transient(t_final=0.5, n_steps=20, bottom_temp=25)
+        T = results['T']
+
+        np.testing.assert_array_almost_equal(T[:, 0], np.ones(20) * 100)
+        np.testing.assert_array_almost_equal(T[:, -1], np.ones(20) * 25)
+        self.assertTrue(np.all(T[:, 1:-1] >= 25))
+        self.assertTrue(np.all(T[:, 1:-1] <= 100))
+
+    def test_temperature_profile_drives_curvature_not_average_only(self):
+        """Test that a through-thickness gradient creates curvature."""
+        td = ThermalDiffusion(
+            self.laminate,
+            self.analysis,
+            top_surface_temp=100,
+            initial_temp=25,
+            thermal_diffusivity=1e-6,
+            n_nodes=50
+        )
+
+        gradient_profile = np.linspace(100, 25, 50)
+        uniform_profile = np.ones(50) * np.mean(gradient_profile)
+
+        _, gradient_curvature = td._compute_strains_from_profile(gradient_profile)
+        _, uniform_curvature = td._compute_strains_from_profile(uniform_profile)
+
+        self.assertGreater(np.linalg.norm(gradient_curvature), 1e-8)
+        self.assertGreater(
+            np.linalg.norm(gradient_curvature),
+            10 * np.linalg.norm(uniform_curvature)
+        )
 
 
 class TestThermalDiffusionAnalyzer(unittest.TestCase):
@@ -875,6 +919,49 @@ class TestThermalDiffusionAnalyzer(unittest.TestCase):
         strain_final = results['strains'][-1, 0]
         
         self.assertNotAlmostEqual(strain_initial, strain_final, places=8)
+
+    def test_default_time_scale_uses_diffusion_time(self):
+        """Test default analysis time is based on h^2/alpha, not an hour."""
+        analyzer = ThermalDiffusionAnalyzer(
+            self.laminate,
+            top_surface_temp=100,
+            initial_temp=25,
+            bottom_surface_temp=25
+        )
+
+        alpha = 1e-6
+        results = analyzer.analyze(
+            n_steps=12,
+            n_nodes=30,
+            thermal_diffusivity=alpha
+        )
+
+        expected_t_final = 2.0 * self.laminate.total_thickness ** 2 / alpha
+        self.assertAlmostEqual(results['t'][-1], expected_t_final)
+        self.assertLess(results['t'][-1], 10.0)
+
+    def test_curvatures_evolve_for_hot_top_room_bottom(self):
+        """Test 100 C top and 25 C bottom produces changing curvatures."""
+        analyzer = ThermalDiffusionAnalyzer(
+            self.laminate,
+            top_surface_temp=100,
+            initial_temp=25,
+            bottom_surface_temp=25
+        )
+
+        results = analyzer.analyze(
+            t_final=0.5,
+            n_steps=40,
+            n_nodes=50,
+            thermal_diffusivity=1e-6
+        )
+
+        curvature_norms = np.linalg.norm(results['curvatures'], axis=1)
+        strain_norms = np.linalg.norm(results['strains'], axis=1)
+
+        self.assertGreater(np.max(curvature_norms), 1e-8)
+        self.assertGreater(np.ptp(curvature_norms), 1e-8)
+        self.assertGreater(np.ptp(strain_norms), 1e-8)
     
     def test_different_diffusivity_speeds(self):
         """Test that lower diffusivity results in slower change."""

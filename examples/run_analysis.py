@@ -22,7 +22,7 @@ from src.workflow import LaminateAnalysis
 # ============================================================================
 
 # ANALYSIS TYPE
-ENABLE_TRANSIENT_THERMAL = False  # Set to True for transient thermal diffusion analysis
+ENABLE_TRANSIENT_THERMAL = True  # Set to True for transient thermal diffusion analysis
                                   # Set to False for steady-state thermal analysis
 
 # Material Properties
@@ -40,10 +40,11 @@ MATERIAL = MaterialProperties(
 DELTA_T = -50  # Negative = cooling, Positive = heating
 
 # TRANSIENT THERMAL DIFFUSION PARAMETERS (only used if ENABLE_TRANSIENT_THERMAL = True)
-INITIAL_TEMP = 20            # Initial temperature throughout laminate (K)
-TOP_SURFACE_TEMP = 100       # Temperature imposed at top surface (K)
+INITIAL_TEMP = 25            # Initial temperature throughout laminate (C)
+TOP_SURFACE_TEMP = 100       # Temperature imposed at top surface (C)
+BOTTOM_SURFACE_TEMP = 25     # Temperature imposed at bottom surface (C)
 THERMAL_DIFFUSIVITY = 1e-6   # Heat diffusivity α = k/(ρ*c) in m²/s
-TRANSIENT_TIME = 3600        # Total analysis time in seconds (1 hour = 3600 s)
+TRANSIENT_TIME = None        # None uses about 2*h^2/alpha for short transients
 TRANSIENT_STEPS = 100        # Number of time steps
 
 # Ply Thickness (meters)
@@ -56,7 +57,7 @@ PLY_THICKNESS = 0.125e-3  # 0.125 mm (standard)
 #   [0, 45, -45, 90, 0, 45, -45, 90, ...]   # 16-ply QI
 #   [0, 90, 0, 90]                          # Cross-ply
 #   [0, 0, 0, 0]                            # Unidirectional
-LAYUP = [5, 0, 0, 23, 0, 0, 0, 5]
+LAYUP = [90,0] 
 
 # ============================================================================
 # RUN ANALYSIS
@@ -81,9 +82,14 @@ if __name__ == "__main__":
         print("="*80)
         print(f"\nLayup: {LAYUP}")
         print(f"Laminate thickness: {laminate.total_thickness*1e3:.3f} mm")
-        print(f"Initial temperature: {INITIAL_TEMP} K")
-        print(f"Top surface temperature: {TOP_SURFACE_TEMP} K")
-        print(f"Analysis duration: {TRANSIENT_TIME} s ({TRANSIENT_TIME/60:.1f} min)")
+        print(f"Initial temperature: {INITIAL_TEMP} C")
+        print(f"Top surface temperature: {TOP_SURFACE_TEMP} C")
+        print(f"Bottom surface temperature: {BOTTOM_SURFACE_TEMP} C")
+        if TRANSIENT_TIME is None:
+            estimated_time = 2.0 * laminate.total_thickness**2 / THERMAL_DIFFUSIVITY
+            print(f"Analysis duration: auto ({estimated_time:.3f} s)")
+        else:
+            print(f"Analysis duration: {TRANSIENT_TIME} s ({TRANSIENT_TIME/60:.1f} min)")
         print(f"Thermal diffusivity: {THERMAL_DIFFUSIVITY:.2e} m²/s")
         
         # Run thermal diffusion analysis
@@ -91,7 +97,8 @@ if __name__ == "__main__":
         analyzer = ThermalDiffusionAnalyzer(
             laminate_properties=laminate,
             top_surface_temp=TOP_SURFACE_TEMP,
-            initial_temp=INITIAL_TEMP
+            initial_temp=INITIAL_TEMP,
+            bottom_surface_temp=BOTTOM_SURFACE_TEMP
         )
         
         results = analyzer.analyze(
