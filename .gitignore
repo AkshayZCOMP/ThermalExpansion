@@ -40,4 +40,6 @@ htmlcov/
 Thumbs.db
 
 # Project temp files
-*.txt
+output.txt
+final_test_results.txt
+*.log
