@@ -16,10 +16,8 @@ symmetric layups. Larger cases grow quickly:
     14 plies:    12^7 = 35,831,808 layups
     16 plies:    12^8 = 429,981,696 layups
 
-To run a larger exhaustive case deliberately:
-
-    set LAYUP_FIELD_PLY_COUNTS=8
-    python tests/test_symmetric_layup_field_signatures.py
+Edit PLY_COUNTS_TO_TEST and MAX_LAYUPS_TO_SEARCH below to control the search.
+PLY_COUNTS_TO_TEST is the only place to edit ply counts.
 """
 
 import itertools
@@ -38,8 +36,18 @@ from src.ThermalDiffusion import ThermalDiffusion
 from src.workflow import LaminateAnalysis
 
 
-REQUESTED_PLY_COUNTS = (3, 4, 5, 6, 7, 8, 10, 12, 14, 16)
-DEFAULT_EXHAUSTIVE_PLY_COUNTS = (3, 4, 5, 6)
+# ============================================================================
+# USER SETTINGS - edit these two lines for the layup search
+# ============================================================================
+
+# Add/remove ply counts here.
+PLY_COUNTS_TO_TEST = (3, 4, 5, 6, 10, 12)
+
+# Maximum layups to search per ply count. Use None for uncapped exhaustive runs.
+MAX_LAYUPS_TO_SEARCH = 10000
+
+# ============================================================================
+
 ANGLE_STEP = 15
 # Use a canonical orientation set. In CLT, +90 and -90 describe the same
 # fiber direction, so including both would create false inverse collisions.
@@ -56,26 +64,47 @@ SIGNATURE_ATOL = 1e-12
 SIGNATURE_RTOL = 1e-9
 SCALAR_ZERO_TOL = 1e-12
 MAX_COLLISIONS_TO_REPORT = 20
-DEFAULT_PLOT_PLY_COUNTS = (3, 4, 5, 6)
-DEFAULT_PLOT_MAX_LAYUPS = 200000
-DEFAULT_SIGNATURE_PLOT_MAX_LAYUPS = 5000
-DEFAULT_PAIRWISE_DISTANCE_SAMPLES = 50000
+DEFAULT_PAIRWISE_DISTANCE_SAMPLES = 10000
 PLOT_FILE = Path(__file__).with_name("layup_field_signature_boxplot.png")
 FIELD_SPREAD_PLOT_FILE = Path(__file__).with_name("layup_field_component_spread.png")
 FIELD_SPREAD_REPORT_FILE = Path(__file__).with_name("layup_field_component_closest_pairs.txt")
+FIELD_COMPARISON_PLOT_FILE = Path(__file__).with_name("layup_field_pair_comparison.png")
 FIELD_COMPONENT_NAMES = ("eps_x", "eps_y", "gamma_xy", "kappa_x", "kappa_y", "kappa_xy")
+VERSIONED_OUTPUT_STEMS = (
+    "layup_field_signature_boxplot",
+    "layup_field_component_spread",
+    "layup_field_component_closest_pairs",
+    "layup_field_pair_comparison",
+)
 
 
 def selected_ply_counts():
-    raw_value = os.getenv("LAYUP_FIELD_PLY_COUNTS")
-    if not raw_value:
-        return DEFAULT_EXHAUSTIVE_PLY_COUNTS
+    return PLY_COUNTS_TO_TEST
 
-    selected = tuple(int(value.strip()) for value in raw_value.split(",") if value.strip())
-    unsupported = set(selected) - set(REQUESTED_PLY_COUNTS)
-    if unsupported:
-        raise ValueError(f"Unsupported ply counts requested: {sorted(unsupported)}")
-    return selected
+
+def validate_user_settings():
+    if not PLY_COUNTS_TO_TEST:
+        raise ValueError("PLY_COUNTS_TO_TEST must contain at least one ply count.")
+
+    invalid_ply_counts = [
+        ply_count
+        for ply_count in PLY_COUNTS_TO_TEST
+        if not isinstance(ply_count, int) or ply_count < 2
+    ]
+    if invalid_ply_counts:
+        raise ValueError(
+            "PLY_COUNTS_TO_TEST values must be integers greater than or equal to 2. "
+            f"Invalid values: {invalid_ply_counts}"
+        )
+
+    if MAX_LAYUPS_TO_SEARCH is not None:
+        if (
+            not isinstance(MAX_LAYUPS_TO_SEARCH, int)
+            or MAX_LAYUPS_TO_SEARCH < 1
+        ):
+            raise ValueError(
+                "MAX_LAYUPS_TO_SEARCH must be a positive integer or None."
+            )
 
 
 def symmetric_base_length(ply_count):
@@ -90,6 +119,34 @@ def capped_layup_count(total_count, max_layups):
     if max_layups is None:
         return total_count
     return min(total_count, max_layups)
+
+
+def next_output_version():
+    """Return the next shared v-number for plot/report artifacts."""
+    output_dir = Path(__file__).parent
+    used_versions = set()
+
+    for stem in VERSIONED_OUTPUT_STEMS:
+        for path in output_dir.glob(f"{stem}_v*.*"):
+            version_text = path.stem.rsplit("_v", 1)[-1]
+            if version_text.isdigit():
+                used_versions.add(int(version_text))
+
+    version = 1
+    while version in used_versions:
+        version += 1
+    return version
+
+
+def versioned_output_paths(version):
+    """Return plot/report paths sharing one version identifier."""
+    output_dir = Path(__file__).parent
+    return {
+        "signature_plot": output_dir / f"layup_field_signature_boxplot_v{version}.png",
+        "component_plot": output_dir / f"layup_field_component_spread_v{version}.png",
+        "closest_report": output_dir / f"layup_field_component_closest_pairs_v{version}.txt",
+        "comparison_plot": output_dir / f"layup_field_pair_comparison_v{version}.png",
+    }
 
 
 def make_symmetric_layup(base_angles, total_plies):
@@ -190,7 +247,7 @@ def signature_bucket(signature):
     return tuple(np.round(signature / SIGNATURE_ATOL).astype(np.int64))
 
 
-def find_signature_collisions(ply_count):
+def find_signature_collisions(ply_count, max_layups=MAX_LAYUPS_TO_SEARCH):
     """
     Exhaustively search one ply count for indistinguishable transient fields.
 
@@ -200,8 +257,18 @@ def find_signature_collisions(ply_count):
     temperature_profiles = transient_temperature_profiles(ply_count)
     signatures_by_bucket = {}
     collisions = []
+    total_count = symmetric_layup_count(ply_count)
+    limit = capped_layup_count(total_count, max_layups)
+
+    print(
+        f"Searching {ply_count}-ply layups: {limit:,} of {total_count:,}",
+        flush=True,
+    )
 
     for index, layup in enumerate(iter_all_symmetric_layups(ply_count), start=1):
+        if max_layups is not None and index > max_layups:
+            break
+
         signature = transient_field_signature(layup, temperature_profiles)
         bucket = signature_bucket(signature)
 
@@ -283,6 +350,24 @@ def collect_field_components(ply_count, max_layups=None):
     return angles, np.array(strains), np.array(curvatures)
 
 
+def final_field_components_for_angles(angles):
+    """Return final-time [microstrain, curvature] values for one explicit layup."""
+    layup = LayupSequence(list(angles), name=f"Comparison layup {angles}")
+    laminate, analysis = analysis_for_layup(layup)
+    temperature_profiles = transient_temperature_profiles(layup.num_plies)
+    final_temperature_profile = temperature_profiles[-1]
+    diffusion = ThermalDiffusion(
+        laminate,
+        analysis,
+        top_surface_temp=TOP_SURFACE_TEMP,
+        initial_temp=INITIAL_TEMP,
+        thermal_diffusivity=THERMAL_DIFFUSIVITY,
+        n_nodes=N_NODES,
+    )
+    strain, curvature = diffusion._compute_strains_from_profile(final_temperature_profile)
+    return np.concatenate((strain * 1e6, curvature))
+
+
 def normalized_pairwise_distance_samples(signatures, max_samples):
     """
     Return deterministic samples from the pairwise normalized distance space.
@@ -316,8 +401,8 @@ def normalized_pairwise_distance_samples(signatures, max_samples):
 
 
 def plot_result_spaces(
-    ply_counts=DEFAULT_PLOT_PLY_COUNTS,
-    max_layups=DEFAULT_SIGNATURE_PLOT_MAX_LAYUPS,
+    ply_counts=PLY_COUNTS_TO_TEST,
+    max_layups=MAX_LAYUPS_TO_SEARCH,
     pairwise_samples=DEFAULT_PAIRWISE_DISTANCE_SAMPLES,
     output_path=PLOT_FILE,
 ):
@@ -453,9 +538,10 @@ def format_closest_pair_report(report_rows):
 
 
 def plot_field_component_spread(
-    ply_counts=DEFAULT_PLOT_PLY_COUNTS,
-    max_layups=DEFAULT_PLOT_MAX_LAYUPS,
+    ply_counts=PLY_COUNTS_TO_TEST,
+    max_layups=MAX_LAYUPS_TO_SEARCH,
     output_path=FIELD_SPREAD_PLOT_FILE,
+    report_path=FIELD_SPREAD_REPORT_FILE,
 ):
     """
     Save box plots of actual final-time strain and curvature result ranges.
@@ -518,29 +604,299 @@ def plot_field_component_spread(
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
 
-    report_path = FIELD_SPREAD_REPORT_FILE
     report_path.write_text(format_closest_pair_report(report_rows), encoding="utf-8")
 
     return output_path, report_path
 
 
+def plot_layup_pair_comparison(
+    ply_count=4,
+    close_component="eps_x",
+    max_layups=MAX_LAYUPS_TO_SEARCH,
+    output_path=FIELD_COMPARISON_PLOT_FILE,
+):
+    """
+    Compare two layup pairs across all six scalar field components.
+
+    Pair 1 is chosen because it is closest in one requested scalar component.
+    Pair 2 is a reference contrast between all-0 and all-90 degree laminates.
+    Component differences are normalized by the searched result-space range
+    for that ply count.
+    """
+    import matplotlib.pyplot as plt
+
+    if close_component not in FIELD_COMPONENT_NAMES:
+        raise ValueError(f"Unknown component: {close_component}")
+
+    total_count = symmetric_layup_count(ply_count)
+    limit = capped_layup_count(total_count, max_layups)
+    angles, strains, curvatures = collect_field_components(ply_count, max_layups=limit)
+    component_values = np.column_stack((strains * 1e6, curvatures))
+    component_min = np.min(component_values, axis=0)
+    component_max = np.max(component_values, axis=0)
+    component_range = np.maximum(component_max - component_min, SCALAR_ZERO_TOL)
+
+    closest_pairs = closest_component_pairs(angles, strains, curvatures)
+    close_pair = next(
+        pair for pair in closest_pairs if pair["component"] == close_component
+    )
+    close_angles_a = close_pair["first_angles"]
+    close_angles_b = close_pair["second_angles"]
+
+    reference_angles_a = tuple([0] * ply_count)
+    reference_angles_b = tuple([90] * ply_count)
+    pair_specs = (
+        (
+            f"Closest in {close_component}",
+            close_angles_a,
+            close_angles_b,
+        ),
+        (
+            "Reference: all 0 vs all 90",
+            reference_angles_a,
+            reference_angles_b,
+        ),
+    )
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex="col")
+    x_positions = np.arange(len(FIELD_COMPONENT_NAMES))
+    width = 0.38
+
+    for row_index, (title, first_angles, second_angles) in enumerate(pair_specs):
+        first_values = final_field_components_for_angles(first_angles)
+        second_values = final_field_components_for_angles(second_angles)
+        normalized_first = (first_values - component_min) / component_range
+        normalized_second = (second_values - component_min) / component_range
+        normalized_difference = np.abs(first_values - second_values) / component_range
+
+        value_ax = axes[row_index, 0]
+        difference_ax = axes[row_index, 1]
+
+        value_ax.bar(
+            x_positions - width / 2,
+            normalized_first,
+            width=width,
+            label=str(first_angles),
+        )
+        value_ax.bar(
+            x_positions + width / 2,
+            normalized_second,
+            width=width,
+            label=str(second_angles),
+        )
+        value_ax.set_title(title)
+        value_ax.set_ylabel("Normalized component value")
+        value_ax.set_ylim(-0.05, 1.05)
+        value_ax.grid(axis="y", alpha=0.3)
+        value_ax.legend(fontsize=7, loc="best")
+
+        difference_ax.bar(x_positions, normalized_difference, color="#4c78a8")
+        difference_ax.set_title("Absolute difference by component")
+        difference_ax.set_ylabel("Difference / searched range")
+        difference_ax.grid(axis="y", alpha=0.3)
+
+        for component_index, difference in enumerate(normalized_difference):
+            difference_ax.text(
+                component_index,
+                difference,
+                f"{difference:.2g}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+    for ax in axes[-1, :]:
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(FIELD_COMPONENT_NAMES, rotation=30, ha="right")
+
+    fig.suptitle(
+        f"{ply_count}-ply layup field comparison "
+        f"(searched {len(angles):,} of {total_count:,} layups)"
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+    return output_path
+
+
 class TestSymmetricLayupFieldSignatures(unittest.TestCase):
     """Exhaustive tests for one-to-one symmetric layup field signatures."""
 
-    def test_requested_ply_counts_are_known(self):
-        self.assertEqual(REQUESTED_PLY_COUNTS, (3, 4, 5, 6, 7, 8, 10, 12, 14, 16))
+    def test_user_settings_are_valid(self):
+        validate_user_settings()
 
     def test_all_possible_symmetric_layups_have_unique_transient_fields(self):
+        validate_user_settings()
         failures = []
 
         for ply_count in selected_ply_counts():
             with self.subTest(ply_count=ply_count):
-                collisions = find_signature_collisions(ply_count)
+                collisions = find_signature_collisions(
+                    ply_count,
+                    max_layups=MAX_LAYUPS_TO_SEARCH,
+                )
                 if collisions:
                     failures.append((ply_count, symmetric_layup_count(ply_count), collisions))
 
         if failures:
             self.fail(format_collision_report(failures))
+
+    def test_reversed_two_ply_laminates_have_same_ad_different_transient_response(self):
+        """
+        Reversing [0, 90] to [90, 0] preserves A and D but flips B.
+
+        This is the simplest laminate pair for showing why transient thermal
+        response depends on ply order, not only angle inventory. The full ABD
+        matrices are not identical because these two-ply laminates are
+        unsymmetric, but their extensional and bending stiffness blocks match.
+        """
+        layup_a = LayupSequence([0, 90], name="[0/90]")
+        layup_b = LayupSequence([90, 0], name="[90/0]")
+
+        laminate_a, analysis_a = analysis_for_layup(layup_a)
+        laminate_b, analysis_b = analysis_for_layup(layup_b)
+
+        np.testing.assert_allclose(
+            analysis_a.A_matrix,
+            analysis_b.A_matrix,
+            rtol=1e-12,
+            atol=1e-8,
+        )
+        np.testing.assert_allclose(
+            analysis_a.D_matrix,
+            analysis_b.D_matrix,
+            rtol=1e-12,
+            atol=1e-16,
+        )
+        np.testing.assert_allclose(
+            analysis_a.B_matrix,
+            -analysis_b.B_matrix,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+        diffusion_a = ThermalDiffusion(
+            laminate_a,
+            analysis_a,
+            top_surface_temp=TOP_SURFACE_TEMP,
+            initial_temp=INITIAL_TEMP,
+            thermal_diffusivity=THERMAL_DIFFUSIVITY,
+            n_nodes=N_NODES,
+        )
+        diffusion_b = ThermalDiffusion(
+            laminate_b,
+            analysis_b,
+            top_surface_temp=TOP_SURFACE_TEMP,
+            initial_temp=INITIAL_TEMP,
+            thermal_diffusivity=THERMAL_DIFFUSIVITY,
+            n_nodes=N_NODES,
+        )
+
+        t_final = 2.0 * diffusion_a.estimate_diffusion_time_scale()
+        temperatures = diffusion_a.solve_transient(
+            t_final=t_final,
+            n_steps=N_STEPS,
+            bottom_temp=BOTTOM_SURFACE_TEMP,
+        )["T"]
+
+        response_a = []
+        response_b = []
+        for temperature_profile in temperatures:
+            strain_a, curvature_a = diffusion_a._compute_strains_from_profile(
+                temperature_profile
+            )
+            strain_b, curvature_b = diffusion_b._compute_strains_from_profile(
+                temperature_profile
+            )
+            response_a.append(np.concatenate((strain_a, curvature_a)))
+            response_b.append(np.concatenate((strain_b, curvature_b)))
+
+        response_a = np.array(response_a)
+        response_b = np.array(response_b)
+
+        self.assertGreater(
+            np.max(np.abs(response_a - response_b)),
+            1e-8,
+            msg="Reversing [0/90] should change the transient thermal response.",
+        )
+
+    def test_symmetric_qi_order_change_preserves_a_but_changes_d_and_transient_response(self):
+        """
+        Compare [0/45/-45/90]s and [90/-45/45/0]s.
+
+        These laminates have the same angle inventory and both are symmetric,
+        so their extensional stiffness A is the same and B is approximately
+        zero. They do not have the same D matrix because bending stiffness is
+        weighted by distance from the midplane; moving 0-degree plies from the
+        outside to the inside changes the bending response.
+        """
+        layup_1 = LayupSequence(
+            [0, 45, -45, 90, 90, -45, 45, 0],
+            name="[0/45/-45/90]s",
+        )
+        layup_2 = LayupSequence(
+            [90, -45, 45, 0, 0, 45, -45, 90],
+            name="[90/-45/45/0]s",
+        )
+
+        laminate_1, analysis_1 = analysis_for_layup(layup_1)
+        laminate_2, analysis_2 = analysis_for_layup(layup_2)
+
+        np.testing.assert_allclose(
+            analysis_1.A_matrix,
+            analysis_2.A_matrix,
+            rtol=1e-12,
+            atol=1e-8,
+        )
+        self.assertLess(np.max(np.abs(analysis_1.B_matrix)), 1e-6)
+        self.assertLess(np.max(np.abs(analysis_2.B_matrix)), 1e-6)
+        self.assertGreater(
+            np.max(np.abs(analysis_1.D_matrix - analysis_2.D_matrix)),
+            1.0,
+            msg="Changing symmetric ply order should change bending stiffness D.",
+        )
+
+        diffusion_1 = ThermalDiffusion(
+            laminate_1,
+            analysis_1,
+            top_surface_temp=TOP_SURFACE_TEMP,
+            initial_temp=INITIAL_TEMP,
+            thermal_diffusivity=THERMAL_DIFFUSIVITY,
+            n_nodes=N_NODES,
+        )
+        diffusion_2 = ThermalDiffusion(
+            laminate_2,
+            analysis_2,
+            top_surface_temp=TOP_SURFACE_TEMP,
+            initial_temp=INITIAL_TEMP,
+            thermal_diffusivity=THERMAL_DIFFUSIVITY,
+            n_nodes=N_NODES,
+        )
+
+        temperatures = transient_temperature_profiles(layup_1.num_plies)
+        response_differences = []
+        for temperature_profile in temperatures:
+            strain_1, curvature_1 = diffusion_1._compute_strains_from_profile(
+                temperature_profile
+            )
+            strain_2, curvature_2 = diffusion_2._compute_strains_from_profile(
+                temperature_profile
+            )
+            response_differences.append(
+                np.max(
+                    np.abs(
+                        np.concatenate((strain_1, curvature_1))
+                        - np.concatenate((strain_2, curvature_2))
+                    )
+                )
+            )
+
+        self.assertGreater(
+            max(response_differences),
+            1e-8,
+            msg="Different symmetric ply order should change transient response.",
+        )
 
 
 def format_collision_report(failures):
@@ -563,59 +919,57 @@ def format_collision_report(failures):
     return "\n".join(lines)
 
 
-def parse_ply_count_list(raw_value):
-    return tuple(int(value.strip()) for value in raw_value.split(",") if value.strip())
+def generate_versioned_outputs():
+    """Generate all plots/reports for the configured ply counts."""
+    version = next_output_version()
+    paths = versioned_output_paths(version)
+    plot_counts = selected_ply_counts()
 
+    print(
+        f"Generating v{version} plots/reports for ply counts {plot_counts} "
+        f"with max layups {MAX_LAYUPS_TO_SEARCH}...",
+        flush=True,
+    )
 
-def parse_layup_cap(raw_value, default_value):
-    if raw_value is None:
-        return default_value
+    plot_path = plot_result_spaces(
+        ply_counts=plot_counts,
+        max_layups=MAX_LAYUPS_TO_SEARCH,
+        pairwise_samples=int(
+            os.getenv(
+                "LAYUP_FIELD_PAIRWISE_DISTANCE_SAMPLES",
+                DEFAULT_PAIRWISE_DISTANCE_SAMPLES,
+            )
+        ),
+        output_path=paths["signature_plot"],
+    )
+    spread_plot_path, closest_pair_report_path = plot_field_component_spread(
+        ply_counts=plot_counts,
+        max_layups=MAX_LAYUPS_TO_SEARCH,
+        output_path=paths["component_plot"],
+        report_path=paths["closest_report"],
+    )
+    comparison_plot_path = plot_layup_pair_comparison(
+        ply_count=int(os.getenv("LAYUP_FIELD_COMPARISON_PLY_COUNT", "4")),
+        close_component=os.getenv("LAYUP_FIELD_COMPARISON_COMPONENT", "eps_x"),
+        max_layups=MAX_LAYUPS_TO_SEARCH,
+        output_path=paths["comparison_plot"],
+    )
 
-    cleaned_value = raw_value.strip().lower()
-    if cleaned_value in ("", "default"):
-        return default_value
-    if cleaned_value in ("all", "none", "uncapped", "0"):
-        return None
-
-    parsed_value = int(cleaned_value)
-    if parsed_value < 0:
-        raise ValueError("Layup cap must be positive, 0, or ALL")
-    return parsed_value
+    print(f"Saved v{version} result-space box plot to: {plot_path}")
+    print(f"Saved v{version} field-component spread plot to: {spread_plot_path}")
+    print(f"Saved v{version} closest-component-pair report to: {closest_pair_report_path}")
+    print(f"Saved v{version} layup-pair comparison plot to: {comparison_plot_path}")
 
 
 if __name__ == "__main__":
+    validate_user_settings()
     if "--plot" in sys.argv:
         sys.argv.remove("--plot")
-        raw_plot_counts = os.getenv("LAYUP_FIELD_PLOT_PLY_COUNTS")
-        plot_counts = (
-            parse_ply_count_list(raw_plot_counts)
-            if raw_plot_counts
-            else DEFAULT_PLOT_PLY_COUNTS
-        )
-        component_plot_max_layups = parse_layup_cap(
-            os.getenv("LAYUP_FIELD_PLOT_MAX_LAYUPS"),
-            DEFAULT_PLOT_MAX_LAYUPS,
-        )
-        signature_plot_max_layups = parse_layup_cap(
-            os.getenv("LAYUP_FIELD_SIGNATURE_PLOT_MAX_LAYUPS"),
-            DEFAULT_SIGNATURE_PLOT_MAX_LAYUPS,
-        )
-        plot_path = plot_result_spaces(
-            ply_counts=plot_counts,
-            max_layups=signature_plot_max_layups,
-            pairwise_samples=int(
-                os.getenv(
-                    "LAYUP_FIELD_PAIRWISE_DISTANCE_SAMPLES",
-                    DEFAULT_PAIRWISE_DISTANCE_SAMPLES,
-                )
-            ),
-        )
-        spread_plot_path, closest_pair_report_path = plot_field_component_spread(
-            ply_counts=plot_counts,
-            max_layups=component_plot_max_layups,
-        )
-        print(f"Saved result-space box plot to: {plot_path}")
-        print(f"Saved field-component spread plot to: {spread_plot_path}")
-        print(f"Saved closest-component-pair report to: {closest_pair_report_path}")
+        generate_versioned_outputs()
     else:
-        unittest.main(verbosity=2)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
+            TestSymmetricLayupFieldSignatures
+        )
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        generate_versioned_outputs()
+        sys.exit(0 if result.wasSuccessful() else 1)
