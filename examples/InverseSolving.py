@@ -33,29 +33,34 @@ MATERIAL = MaterialProperties(
 )
 
 PLY_THICKNESS = 0.125e-3
-LAYUP = [0, -45, 15,15, -45,0]
+LAYUP = [0,45,20, 0]
 
-INITIAL_TEMP = 20
-TOP_SURFACE_TEMP = 100
-BOTTOM_SURFACE_TEMP = 25
+INITIAL_TEMP = 25
+TOP_SURFACE_TEMP = 50
+BOTTOM_SURFACE_TEMP = 40
 ANALYSIS_TIME = None
 N_TIME_STEPS = 100
 N_SPATIAL_NODES = 75
 THERMAL_DIFFUSIVITY = 1e-6
 
-CANDIDATE_ANGLES = list(range(-90, 91, 15))
-SOLVER_METHOD = "beam" #exhasutive, beam, 
+CANDIDATE_ANGLES = list(range(-75, 91, 15))
+SOLVER_METHOD = "beam"  # coordinate, multi_start_coordinate, iterated_local_search, beam
 BEAM_WIDTH = 50
+ILS_RESTARTS = 20
+ILS_PERTURBATIONS_PER_RESTART = 8
+ILS_PERTURBATION_SIZE = 2
 ASSUME_SYMMETRIC_LAYUP = True
 RUN_VALIDATION_CASES = False
 VALIDATION_PLY_COUNTS = [2, 3, 4, 5, 6, 7, 8]
 VALIDATION_CASES_PER_PLY_COUNT = 60
 VALIDATION_RANDOM_SEED = 11
 VALIDATION_RESPONSE_ERROR_TOLERANCE = 1e-8
-INVERSE_RANDOM_STARTS = 25
+INVERSE_RANDOM_STARTS = 20
 INVERSE_MAX_ITERATIONS = 40
 INVERSE_TOLERANCE = 1e-12
-MIN_RESPONSE_SCALE = 1e-12
+INVERSE_SUCCESS_TOLERANCE = 1e-8
+STRAIN_SCALE_FLOOR = 1e-6
+CURVATURE_SCALE_FLOOR = 1e-3
 
 
 # ============================================================================
@@ -180,13 +185,16 @@ def inverse_solve_top_surface_temp(
 
 def normalize_response(response):
     """
-    Scale each strain/curvature component by the measured target magnitude.
+    Scale each response component with separate strain and curvature floors.
 
-    This makes the solver compare relative error in each response component:
-    eps_x, eps_y, gamma_xy, kappa_x, kappa_y, and kappa_xy.
+    The floors prevent near-zero target components from dominating the inverse
+    loss through division by tiny numerical values.
     """
     response = np.asarray(response, dtype=float)
-    return np.maximum(np.abs(response), MIN_RESPONSE_SCALE)
+    scale = np.abs(response)
+    scale[:3] = np.maximum(scale[:3], STRAIN_SCALE_FLOOR)
+    scale[3:6] = np.maximum(scale[3:6], CURVATURE_SCALE_FLOOR)
+    return scale
 
 
 def make_symmetric_layup(independent_angles, num_plies):
@@ -334,22 +342,18 @@ def score_layup_candidate(
     return result
 
 
-def inverse_solve_layup_from_gradient(
-    target_response,
-    z_thermal,
-    temperature_profile,
-    reference_temp,
-    num_plies,
-):
-    """
-    Predict the layup angles from a known gradient response.
+def solver_method():
+    """Return the configured solver method in normalized form."""
+    return SOLVER_METHOD.lower()
 
-    This checks all allowed angles concurrently for each ply position and
-    repeats from multiple starting points. It avoids changing material Q;
-    instead, candidate angles change Q_bar, ABD, N_T, and M_T.
-    """
-    rng = np.random.default_rng(7)
-    response_scale = normalize_response(target_response)
+
+def solution_found(result):
+    """Return True when the inverse response error is effectively solved."""
+    return result["error"] <= INVERSE_SUCCESS_TOLERANCE
+
+
+def coordinate_descent_starts(num_plies, num_starts, rng):
+    """Build deterministic and random starts for coordinate descent."""
     starts = [
         [0] * num_plies,
         [90, 0] * (num_plies // 2) + ([90] if num_plies % 2 else []),
@@ -357,7 +361,9 @@ def inverse_solve_layup_from_gradient(
     if ASSUME_SYMMETRIC_LAYUP:
         starts = [symmetrize_layup(start) for start in starts]
 
-    while len(starts) < INVERSE_RANDOM_STARTS:
+    starts = starts[:num_starts]
+
+    while len(starts) < num_starts:
         if ASSUME_SYMMETRIC_LAYUP:
             independent_count = (num_plies + 1) // 2
             independent = rng.choice(CANDIDATE_ANGLES, size=independent_count)
@@ -365,52 +371,204 @@ def inverse_solve_layup_from_gradient(
         else:
             starts.append(list(rng.choice(CANDIDATE_ANGLES, size=num_plies)))
 
+    return starts
+
+
+def local_coordinate_descent(
+    start_layup,
+    target_response,
+    response_scale,
+    z_thermal,
+    temperature_profile,
+    reference_temp,
+    num_plies,
+):
+    """Run one coordinate-descent search from a complete starting layup."""
+    current_layup = list(start_layup)
+    current = score_layup_candidate(
+        current_layup,
+        target_response,
+        response_scale,
+        z_thermal,
+        temperature_profile,
+        reference_temp,
+    )
+    if solution_found(current):
+        current["iterations"] = 0
+        current["early_stopped"] = True
+        return current
+
+    for iteration in range(1, INVERSE_MAX_ITERATIONS + 1):
+        previous_error = current["error"]
+
+        for ply_index in get_search_ply_indices(num_plies):
+            trial_layups = []
+            for angle in CANDIDATE_ANGLES:
+                trial_layups.append(set_candidate_angle(current_layup, ply_index, angle))
+
+            with ThreadPoolExecutor() as executor:
+                trial_results = list(executor.map(
+                    lambda angles: score_layup_candidate(
+                        angles,
+                        target_response,
+                        response_scale,
+                        z_thermal,
+                        temperature_profile,
+                        reference_temp,
+                    ),
+                    trial_layups,
+                ))
+
+            current = min(trial_results, key=lambda item: item["error"])
+            current_layup = current["layup"]
+            if solution_found(current):
+                current["iterations"] = iteration
+                current["early_stopped"] = True
+                return current
+
+        if previous_error - current["error"] < INVERSE_TOLERANCE:
+            break
+
+    current["iterations"] = iteration
+    current["early_stopped"] = False
+    return current
+
+
+def inverse_solve_layup_from_gradient_coordinate_descent(
+    target_response,
+    z_thermal,
+    temperature_profile,
+    reference_temp,
+    num_plies,
+    num_starts=1,
+):
+    """
+    Predict the layup angles from a known gradient response.
+
+    This checks all allowed angles concurrently for each ply position. It can
+    repeat from multiple starting points. It avoids changing material Q;
+    instead, candidate angles change Q_bar, ABD, N_T, and M_T.
+    """
+    rng = np.random.default_rng(7)
+    response_scale = normalize_response(target_response)
+    starts = coordinate_descent_starts(num_plies, num_starts, rng)
+
     best_overall = None
 
     for start_index, start in enumerate(starts, start=1):
-        current_layup = start
-        current = score_layup_candidate(
-            current_layup,
+        current = local_coordinate_descent(
+            start,
             target_response,
             response_scale,
             z_thermal,
             temperature_profile,
             reference_temp,
+            num_plies,
         )
-
-        for iteration in range(1, INVERSE_MAX_ITERATIONS + 1):
-            previous_error = current["error"]
-
-            for ply_index in get_search_ply_indices(num_plies):
-                trial_layups = []
-                for angle in CANDIDATE_ANGLES:
-                    trial_layups.append(set_candidate_angle(current_layup, ply_index, angle))
-
-                with ThreadPoolExecutor() as executor:
-                    trial_results = list(executor.map(
-                        lambda angles: score_layup_candidate(
-                            angles,
-                            target_response,
-                            response_scale,
-                            z_thermal,
-                            temperature_profile,
-                            reference_temp,
-                        ),
-                        trial_layups,
-                    ))
-
-                current = min(trial_results, key=lambda item: item["error"])
-                current_layup = current["layup"]
-
-            if previous_error - current["error"] < INVERSE_TOLERANCE:
-                break
-
         current["start_index"] = start_index
-        current["iterations"] = iteration
 
         if best_overall is None or current["error"] < best_overall["error"]:
             best_overall = current
+            if solution_found(best_overall):
+                best_overall["early_stopped"] = True
+                return best_overall
 
+    return best_overall
+
+
+def perturb_layup(layup_angles, perturbation_size, rng):
+    """Randomly change a few independent ply angles, preserving symmetry."""
+    perturbed = list(layup_angles)
+    search_indices = get_search_ply_indices(len(perturbed))
+    num_changes = min(perturbation_size, len(search_indices))
+    selected_indices = rng.choice(search_indices, size=num_changes, replace=False)
+
+    for ply_index in selected_indices:
+        ply_index = int(ply_index)
+        current_angle = perturbed[ply_index]
+        choices = [angle for angle in CANDIDATE_ANGLES if angle != current_angle]
+        new_angle = int(rng.choice(choices))
+        perturbed = set_candidate_angle(perturbed, ply_index, new_angle)
+
+    return perturbed
+
+
+def inverse_solve_layup_from_gradient_iterated_local_search(
+    target_response,
+    z_thermal,
+    temperature_profile,
+    reference_temp,
+    num_plies,
+):
+    """
+    Predict layup angles using multi-start iterated local search.
+
+    Each restart descends to a local optimum, perturbs that solution, then
+    descends again. This keeps coordinate descent fast while giving it repeated
+    chances to leave local minima.
+    """
+    rng = np.random.default_rng(13)
+    response_scale = normalize_response(target_response)
+    starts = coordinate_descent_starts(num_plies, ILS_RESTARTS, rng)
+    best_overall = None
+    total_local_searches = 0
+
+    for restart_index, start in enumerate(starts, start=1):
+        current = local_coordinate_descent(
+            start,
+            target_response,
+            response_scale,
+            z_thermal,
+            temperature_profile,
+            reference_temp,
+            num_plies,
+        )
+        current["restart_index"] = restart_index
+        total_local_searches += 1
+
+        if best_overall is None or current["error"] < best_overall["error"]:
+            best_overall = current
+            if solution_found(best_overall):
+                best_overall["ils_restarts"] = ILS_RESTARTS
+                best_overall["ils_perturbations_per_restart"] = ILS_PERTURBATIONS_PER_RESTART
+                best_overall["ils_perturbation_size"] = ILS_PERTURBATION_SIZE
+                best_overall["local_searches"] = total_local_searches
+                best_overall["early_stopped"] = True
+                return best_overall
+
+        for perturbation_index in range(1, ILS_PERTURBATIONS_PER_RESTART + 1):
+            perturbed_layup = perturb_layup(current["layup"], ILS_PERTURBATION_SIZE, rng)
+            candidate = local_coordinate_descent(
+                perturbed_layup,
+                target_response,
+                response_scale,
+                z_thermal,
+                temperature_profile,
+                reference_temp,
+                num_plies,
+            )
+            candidate["restart_index"] = restart_index
+            candidate["perturbation_index"] = perturbation_index
+            total_local_searches += 1
+
+            if candidate["error"] <= current["error"]:
+                current = candidate
+
+            if candidate["error"] < best_overall["error"]:
+                best_overall = candidate
+                if solution_found(best_overall):
+                    best_overall["ils_restarts"] = ILS_RESTARTS
+                    best_overall["ils_perturbations_per_restart"] = ILS_PERTURBATIONS_PER_RESTART
+                    best_overall["ils_perturbation_size"] = ILS_PERTURBATION_SIZE
+                    best_overall["local_searches"] = total_local_searches
+                    best_overall["early_stopped"] = True
+                    return best_overall
+
+    best_overall["ils_restarts"] = ILS_RESTARTS
+    best_overall["ils_perturbations_per_restart"] = ILS_PERTURBATIONS_PER_RESTART
+    best_overall["ils_perturbation_size"] = ILS_PERTURBATION_SIZE
+    best_overall["local_searches"] = total_local_searches
+    best_overall["early_stopped"] = False
     return best_overall
 
 
@@ -461,6 +619,13 @@ def inverse_solve_layup_from_gradient_beam(
         ))
 
     beam = sorted(beam, key=lambda item: item["error"])[:BEAM_WIDTH]
+    if solution_found(beam[0]):
+        best = beam[0]
+        best["iterations"] = 0
+        best["beam_width"] = BEAM_WIDTH
+        best["beam"] = beam
+        best["early_stopped"] = True
+        return best
 
     for iteration in range(1, INVERSE_MAX_ITERATIONS + 1):
         previous_best_error = beam[0]["error"]
@@ -489,6 +654,13 @@ def inverse_solve_layup_from_gradient_beam(
                 ))
 
             beam = sorted(trial_results, key=lambda item: item["error"])[:BEAM_WIDTH]
+            if solution_found(beam[0]):
+                best = beam[0]
+                best["iterations"] = iteration
+                best["beam_width"] = BEAM_WIDTH
+                best["beam"] = beam
+                best["early_stopped"] = True
+                return best
 
         improvement = previous_best_error - beam[0]["error"]
         if improvement < INVERSE_TOLERANCE:
@@ -498,6 +670,7 @@ def inverse_solve_layup_from_gradient_beam(
     best["iterations"] = iteration
     best["beam_width"] = BEAM_WIDTH
     best["beam"] = beam
+    best["early_stopped"] = False
     return best
 
 
@@ -509,7 +682,8 @@ def solve_layup_inverse(
     num_plies,
 ):
     """Dispatch to the configured inverse solver."""
-    if SOLVER_METHOD == "beam":
+    method = solver_method()
+    if method == "beam":
         return inverse_solve_layup_from_gradient_beam(
             target_response=target_response,
             z_thermal=z_thermal,
@@ -518,12 +692,38 @@ def solve_layup_inverse(
             num_plies=num_plies,
         )
 
-    return inverse_solve_layup_from_gradient(
-        target_response=target_response,
-        z_thermal=z_thermal,
-        temperature_profile=temperature_profile,
-        reference_temp=reference_temp,
-        num_plies=num_plies,
+    if method in ("coordinate", "coordinate_descent"):
+        return inverse_solve_layup_from_gradient_coordinate_descent(
+            target_response=target_response,
+            z_thermal=z_thermal,
+            temperature_profile=temperature_profile,
+            reference_temp=reference_temp,
+            num_plies=num_plies,
+            num_starts=1,
+        )
+
+    if method in ("multi_start_coordinate", "multi_start_coordinate_descent"):
+        return inverse_solve_layup_from_gradient_coordinate_descent(
+            target_response=target_response,
+            z_thermal=z_thermal,
+            temperature_profile=temperature_profile,
+            reference_temp=reference_temp,
+            num_plies=num_plies,
+            num_starts=INVERSE_RANDOM_STARTS,
+        )
+
+    if method in ("iterated_local_search", "ils"):
+        return inverse_solve_layup_from_gradient_iterated_local_search(
+            target_response=target_response,
+            z_thermal=z_thermal,
+            temperature_profile=temperature_profile,
+            reference_temp=reference_temp,
+            num_plies=num_plies,
+        )
+
+    raise ValueError(
+        "SOLVER_METHOD must be 'coordinate', 'multi_start_coordinate', "
+        "'iterated_local_search', or 'beam'."
     )
 
 
@@ -567,7 +767,16 @@ def validate_inverse_solver(
     print("INVERSE SOLVER VALIDATION")
     print("=" * 80)
     print(f"Solver method: {SOLVER_METHOD}")
-    print(f"Beam width: {BEAM_WIDTH if SOLVER_METHOD == 'beam' else 'n/a'}")
+    if solver_method() == "beam":
+        print(f"Beam width: {BEAM_WIDTH}")
+    elif solver_method() in ("coordinate", "coordinate_descent"):
+        print("Coordinate starts: 1")
+    elif solver_method() in ("multi_start_coordinate", "multi_start_coordinate_descent"):
+        print(f"Coordinate starts: {INVERSE_RANDOM_STARTS}")
+    elif solver_method() in ("iterated_local_search", "ils"):
+        print(f"ILS restarts: {ILS_RESTARTS}")
+        print(f"ILS perturbations per restart: {ILS_PERTURBATIONS_PER_RESTART}")
+        print(f"ILS perturbation size: {ILS_PERTURBATION_SIZE}")
     print(f"Assume symmetric layup: {ASSUME_SYMMETRIC_LAYUP}")
     print(f"Cases per ply count: {cases_per_ply_count}")
     print(f"Candidate angles: {CANDIDATE_ANGLES}")
@@ -772,10 +981,20 @@ if __name__ == "__main__":
         print("Warning: target layup is not symmetric, so exact recovery is not allowed.")
     print(f"Predicted layup: {best_layup['layup']}")
     print(f"Solver method: {SOLVER_METHOD}")
-    if SOLVER_METHOD == "beam":
+    if solver_method() == "beam":
         print(f"Beam width: {best_layup['beam_width']}")
+    elif solver_method() in ("coordinate", "coordinate_descent"):
+        print("Coordinate starts: 1")
+    elif solver_method() in ("multi_start_coordinate", "multi_start_coordinate_descent"):
+        print(f"Coordinate starts: {INVERSE_RANDOM_STARTS}")
+    elif solver_method() in ("iterated_local_search", "ils"):
+        print(f"ILS restarts: {best_layup['ils_restarts']}")
+        print(f"ILS perturbations per restart: {best_layup['ils_perturbations_per_restart']}")
+        print(f"ILS perturbation size: {best_layup['ils_perturbation_size']}")
+        print(f"Local searches: {best_layup['local_searches']}")
     print(f"Candidate angles: {CANDIDATE_ANGLES}")
     print(f"Converged error: {best_layup['error']:.6e}")
+    print(f"Early stopped on exact response: {best_layup.get('early_stopped', False)}")
     print(f"Strain-only normalized error: {best_layup['strain_error']:.6e}")
     print(f"Curvature-only normalized error: {best_layup['curvature_error']:.6e}")
     if "start_index" in best_layup:

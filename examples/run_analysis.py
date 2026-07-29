@@ -26,6 +26,7 @@ from src.workflow import LaminateAnalysis
 ENABLE_TRANSIENT_THERMAL = True  # Set to True for transient thermal diffusion analysis
                                   # Set to False for steady-state thermal analysis
 ENABLE_INVERSE_SOLVING = True     # Uses gradient strains/curvatures to recover a layup
+ASSUME_SYMMETRIC_LAYUP = True     # In inverse solving, mirror ply i with ply n-i+1
 
 # Material Properties
 MATERIAL = MaterialProperties(
@@ -50,11 +51,12 @@ TRANSIENT_TIME = None        # None uses about 2*h^2/alpha for short transients
 TRANSIENT_STEPS = 100        # Number of time steps
 
 # INVERSE SOLVER PARAMETERS
-CANDIDATE_ANGLES = list(range(-90, 91, 15))
+CANDIDATE_ANGLES = list(range(-75, 91, 15))
 INVERSE_RANDOM_STARTS = 20
 INVERSE_MAX_ITERATIONS = 30
 INVERSE_TOLERANCE = 1e-12
-INVERSE_WEIGHT_CURVATURES = 1e-3
+STRAIN_SCALE_FLOOR = 1e-6
+CURVATURE_SCALE_FLOOR = 1e-3
 
 # Ply Thickness (meters)
 PLY_THICKNESS = 0.125e-3  # 0.125 mm (standard)
@@ -66,17 +68,18 @@ PLY_THICKNESS = 0.125e-3  # 0.125 mm (standard)
 #   [0, 45, -45, 90, 0, 45, -45, 90, ...]   # 16-ply QI
 #   [0, 90, 0, 90]                          # Cross-ply
 #   [0, 0, 0, 0]                            # Unidirectional
-LAYUP = [90,0, 90] 
+LAYUP = [0, 90, 90, 0]
 
 # ============================================================================
 # INVERSE SOLVING HELPERS
 # ============================================================================
 
 def normalize_response(response):
-    """Scale strain/curvature response so the inverse error is dimensionless."""
+    """Scale response with floors so tiny target components do not dominate."""
     response = np.asarray(response, dtype=float)
-    scale = np.maximum(np.abs(response), 1e-12)
-    scale[3:6] = np.maximum(scale[3:6], INVERSE_WEIGHT_CURVATURES)
+    scale = np.abs(response)
+    scale[:3] = np.maximum(scale[:3], STRAIN_SCALE_FLOOR)
+    scale[3:6] = np.maximum(scale[3:6], CURVATURE_SCALE_FLOOR)
     return scale
 
 
@@ -163,23 +166,73 @@ def score_candidate(layup_angles, target_response, response_scale,
     return result
 
 
+def expand_symmetric_layup(independent_angles, num_plies):
+    """Mirror independent ply angles about the laminate midplane."""
+    independent_angles = list(independent_angles)
+    if num_plies % 2 == 0:
+        mirrored = independent_angles[::-1]
+    else:
+        mirrored = independent_angles[:-1][::-1]
+    return independent_angles + mirrored
+
+
+def random_layup(rng, num_plies, assume_symmetric):
+    """Create a random layup, optionally constrained to be symmetric."""
+    if not assume_symmetric:
+        return list(rng.choice(CANDIDATE_ANGLES, size=num_plies))
+
+    independent_count = (num_plies + 1) // 2
+    independent = rng.choice(CANDIDATE_ANGLES, size=independent_count)
+    return expand_symmetric_layup(independent, num_plies)
+
+
+def alternating_layup(num_plies, assume_symmetric):
+    """Create a simple 90/0 starting point that honors the symmetry setting."""
+    if not assume_symmetric:
+        return [90, 0] * (num_plies // 2) + ([90] if num_plies % 2 else [])
+
+    independent_count = (num_plies + 1) // 2
+    independent = [90, 0] * (independent_count // 2)
+    if independent_count % 2:
+        independent.append(90)
+    return expand_symmetric_layup(independent, num_plies)
+
+
+def ply_update_groups(num_plies, assume_symmetric):
+    """Return ply indices to update together during coordinate descent."""
+    if not assume_symmetric:
+        return [[ply_index] for ply_index in range(num_plies)]
+
+    groups = []
+    for ply_index in range((num_plies + 1) // 2):
+        mirror_index = num_plies - 1 - ply_index
+        if mirror_index == ply_index:
+            groups.append([ply_index])
+        else:
+            groups.append([ply_index, mirror_index])
+    return groups
+
+
 def solve_layup_from_gradient_response(target_response, z_thermal, temperature_profile,
-                                       reference_temp, num_plies):
+                                       reference_temp, num_plies,
+                                       assume_symmetric=False):
     """
     Recover a candidate layup from gradient-induced strains/curvatures.
 
-    Uses concurrent coordinate descent: for each ply, try all allowed angles in
-    parallel, keep the best angle, and repeat until the ABD/Q_bar response
-    stops improving.
+    Uses concurrent coordinate descent: for each ply or symmetric ply pair, try
+    all allowed angles in parallel, keep the best angle, and repeat until the
+    ABD/Q_bar response stops improving.
     """
     rng = np.random.default_rng(7)
     response_scale = normalize_response(target_response)
-    starts = [list(rng.choice(CANDIDATE_ANGLES, size=num_plies))]
+    update_groups = ply_update_groups(num_plies, assume_symmetric)
+
+    starts = [random_layup(rng, num_plies, assume_symmetric)]
     starts.append([0] * num_plies)
-    starts.append([90, 0] * (num_plies // 2) + ([90] if num_plies % 2 else []))
+    starts.append(alternating_layup(num_plies, assume_symmetric))
 
     while len(starts) < INVERSE_RANDOM_STARTS:
-        starts.append(list(rng.choice(CANDIDATE_ANGLES, size=num_plies)))
+        starts.append(random_layup(rng, num_plies, assume_symmetric))
 
     best_overall = None
 
@@ -197,11 +250,12 @@ def solve_layup_from_gradient_response(target_response, z_thermal, temperature_p
         for iteration in range(1, INVERSE_MAX_ITERATIONS + 1):
             previous_error = current["error"]
 
-            for ply_index in range(num_plies):
+            for update_group in update_groups:
                 trial_layups = []
                 for angle in CANDIDATE_ANGLES:
                     trial = current_layup.copy()
-                    trial[ply_index] = angle
+                    for ply_index in update_group:
+                        trial[ply_index] = angle
                     trial_layups.append(trial)
 
                 with ThreadPoolExecutor() as executor:
@@ -242,7 +296,6 @@ def print_gradient_response(label, response):
     print(f"  kappa_x  = {response[3]:+.6e} 1/m")
     print(f"  kappa_y  = {response[4]:+.6e} 1/m")
     print(f"  kappa_xy = {response[5]:+.6e} 1/m")
-
 
 # ============================================================================
 # RUN ANALYSIS
@@ -310,6 +363,7 @@ if __name__ == "__main__":
             print("="*80)
             print(f"Known number of plies: {len(LAYUP)}")
             print(f"Candidate angles: {CANDIDATE_ANGLES}")
+            print(f"Assume symmetric layup: {ASSUME_SYMMETRIC_LAYUP}")
             print("Solving for the candidate Q_bar/ABD response...")
 
             best = solve_layup_from_gradient_response(
@@ -317,7 +371,8 @@ if __name__ == "__main__":
                 z_thermal=results["z"],
                 temperature_profile=results["T"][-1],
                 reference_temp=INITIAL_TEMP,
-                num_plies=len(LAYUP)
+                num_plies=len(LAYUP),
+                assume_symmetric=ASSUME_SYMMETRIC_LAYUP
             )
 
             print(f"\nBest layup found: {best['layup']}")

@@ -49,8 +49,7 @@ MAX_LAYUPS_TO_SEARCH = 10000
 # ============================================================================
 
 ANGLE_STEP = 15
-# Use a canonical orientation set. In CLT, +90 and -90 describe the same
-# fiber direction, so including both would create false inverse collisions.
+# Use a canonical orientation set that includes only one 90-degree direction.
 ANGLE_POOL = tuple(range(-75, 91, ANGLE_STEP))
 
 TOP_SURFACE_TEMP = 100.0
@@ -69,6 +68,9 @@ PLOT_FILE = Path(__file__).with_name("layup_field_signature_boxplot.png")
 FIELD_SPREAD_PLOT_FILE = Path(__file__).with_name("layup_field_component_spread.png")
 FIELD_SPREAD_REPORT_FILE = Path(__file__).with_name("layup_field_component_closest_pairs.txt")
 FIELD_COMPARISON_PLOT_FILE = Path(__file__).with_name("layup_field_pair_comparison.png")
+DELTA_T_COMPONENT_SEPARATION_PLOT_FILE = Path(__file__).with_name(
+    "layup_field_delta_t_component_separation.png"
+)
 FIELD_COMPONENT_NAMES = ("eps_x", "eps_y", "gamma_xy", "kappa_x", "kappa_y", "kappa_xy")
 VERSIONED_OUTPUT_STEMS = (
     "layup_field_signature_boxplot",
@@ -350,6 +352,130 @@ def collect_field_components(ply_count, max_layups=None):
     return angles, np.array(strains), np.array(curvatures)
 
 
+def collect_linear_gradient_field_components(ply_count, delta_t, max_layups=None):
+    """
+    Collect final response components for an ideal linear temperature gradient.
+
+    delta_t is the top-minus-bottom temperature difference. The bottom surface
+    stays at INITIAL_TEMP and the top surface is INITIAL_TEMP + delta_t.
+    """
+    temperature_profile = np.linspace(
+        INITIAL_TEMP + delta_t,
+        INITIAL_TEMP,
+        N_NODES,
+    )
+    strains = []
+    curvatures = []
+    angles = []
+
+    for index, layup in enumerate(iter_all_symmetric_layups(ply_count), start=1):
+        if max_layups is not None and index > max_layups:
+            break
+
+        laminate, analysis = analysis_for_layup(layup)
+        diffusion = ThermalDiffusion(
+            laminate,
+            analysis,
+            top_surface_temp=INITIAL_TEMP + delta_t,
+            initial_temp=INITIAL_TEMP,
+            thermal_diffusivity=THERMAL_DIFFUSIVITY,
+            n_nodes=N_NODES,
+        )
+        strain, curvature = diffusion._compute_strains_from_profile(
+            temperature_profile
+        )
+
+        angles.append(tuple(layup.angles))
+        strains.append(strain)
+        curvatures.append(curvature)
+
+    return angles, np.array(strains), np.array(curvatures)
+
+
+def nearest_nonzero_component_separation(component_values):
+    """Return nearest nonzero spacing in sorted scalar component values."""
+    sorted_values = np.sort(component_values)
+    differences = np.abs(np.diff(sorted_values))
+    nonzero_differences = differences[differences > SCALAR_ZERO_TOL]
+
+    if len(nonzero_differences) == 0:
+        return 0.0
+
+    return float(np.min(nonzero_differences))
+
+
+def plot_delta_t_component_separation(
+    ply_count=8,
+    delta_t_values=(1, 2, 5, 10, 25, 50),
+    max_layups=MAX_LAYUPS_TO_SEARCH,
+    output_path=DELTA_T_COMPONENT_SEPARATION_PLOT_FILE,
+):
+    """
+    Plot nearest nonzero component separation for linear gradients.
+
+    Strain components are plotted in microstrain. Curvature components are
+    plotted in 1/m. Each point uses all searched symmetric layups for one
+    top-minus-bottom delta T value.
+    """
+    import matplotlib.pyplot as plt
+
+    delta_t_values = tuple(delta_t_values)
+    strain_separations = {name: [] for name in FIELD_COMPONENT_NAMES[:3]}
+    curvature_separations = {name: [] for name in FIELD_COMPONENT_NAMES[3:]}
+    searched_count = 0
+
+    for delta_t in delta_t_values:
+        _, strains, curvatures = collect_linear_gradient_field_components(
+            ply_count,
+            delta_t,
+            max_layups=max_layups,
+        )
+        searched_count = len(strains)
+        strain_values = strains * 1e6
+
+        for component_index, component_name in enumerate(FIELD_COMPONENT_NAMES[:3]):
+            strain_separations[component_name].append(
+                nearest_nonzero_component_separation(
+                    strain_values[:, component_index]
+                )
+            )
+
+        for component_index, component_name in enumerate(FIELD_COMPONENT_NAMES[3:]):
+            curvature_separations[component_name].append(
+                nearest_nonzero_component_separation(
+                    curvatures[:, component_index]
+                )
+            )
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True)
+
+    for component_name, separations in strain_separations.items():
+        axes[0].plot(delta_t_values, separations, marker="o", label=component_name)
+    axes[0].set_title("Strain Components")
+    axes[0].set_xlabel("Top-bottom delta T (C)")
+    axes[0].set_ylabel("nearest nonzero separation (microstrain)")
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    for component_name, separations in curvature_separations.items():
+        axes[1].plot(delta_t_values, separations, marker="o", label=component_name)
+    axes[1].set_title("Curvature Components")
+    axes[1].set_xlabel("Top-bottom delta T (C)")
+    axes[1].set_ylabel("nearest nonzero separation (1/m)")
+    axes[1].grid(alpha=0.3)
+    axes[1].legend()
+
+    fig.suptitle(
+        f"{ply_count}-ply symmetric layup component separation "
+        f"(searched {searched_count:,} layups)"
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+    return output_path
+
+
 def final_field_components_for_angles(angles):
     """Return final-time [microstrain, curvature] values for one explicit layup."""
     layup = LayupSequence(list(angles), name=f"Comparison layup {angles}")
@@ -619,7 +745,7 @@ def plot_layup_pair_comparison(
     Compare two layup pairs across all six scalar field components.
 
     Pair 1 is chosen because it is closest in one requested scalar component.
-    Pair 2 is a reference contrast between all-0 and all-90 degree laminates.
+    Pair 2 is a reference contrast between all 0-degree and all 90-degree laminates.
     Component differences are normalized by the searched result-space range
     for that ply count.
     """
@@ -725,6 +851,17 @@ class TestSymmetricLayupFieldSignatures(unittest.TestCase):
 
     def test_user_settings_are_valid(self):
         validate_user_settings()
+
+    def test_angle_pool_excludes_negative_ninety(self):
+        self.assertNotIn(-1 * 90, ANGLE_POOL)
+        self.assertEqual(min(ANGLE_POOL), -75)
+
+    def test_nearest_nonzero_component_separation(self):
+        values = np.array([0.0, 0.0, 0.5, 1.25, 2.0])
+        self.assertAlmostEqual(
+            nearest_nonzero_component_separation(values),
+            0.5,
+        )
 
     def test_all_possible_symmetric_layups_have_unique_transient_fields(self):
         validate_user_settings()
@@ -963,7 +1100,23 @@ def generate_versioned_outputs():
 
 if __name__ == "__main__":
     validate_user_settings()
-    if "--plot" in sys.argv:
+    if "--delta-t-plot" in sys.argv:
+        sys.argv.remove("--delta-t-plot")
+        ply_count = int(os.getenv("LAYUP_FIELD_DELTA_T_PLY_COUNT", "8"))
+        delta_t_values = tuple(
+            float(value)
+            for value in os.getenv(
+                "LAYUP_FIELD_DELTA_T_VALUES",
+                "1,2,5,10,25,50",
+            ).split(",")
+        )
+        output_path = plot_delta_t_component_separation(
+            ply_count=ply_count,
+            delta_t_values=delta_t_values,
+            max_layups=MAX_LAYUPS_TO_SEARCH,
+        )
+        print(f"Saved delta-T component separation plot to: {output_path}")
+    elif "--plot" in sys.argv:
         sys.argv.remove("--plot")
         generate_versioned_outputs()
     else:
