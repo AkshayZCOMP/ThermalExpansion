@@ -137,8 +137,9 @@ def alpha_bar(alpha, T, R):
         The transformed CTE vector alpha_bar (3x1)
     """
     
-    # Calculate the transformed CTE vector alpha_bar
-    alpha_bar = R @ T @ np.linalg.inv(R) @ alpha
+    # Transform the engineering-strain CTE vector from lamina axes to laminate axes.
+    strain_transform = R @ T @ np.linalg.inv(R)
+    alpha_bar = np.linalg.inv(strain_transform) @ alpha
     
     return alpha_bar
 
