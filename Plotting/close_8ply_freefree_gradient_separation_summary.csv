@@ -1,0 +1,4 @@
+Thermal gradient (C/m),Strain-vector separation (microstrain),Curvature-vector separation (m^-1),Both cases converged
+-75000.0,1.714107276161192e-06,0.013108441783408822,True
+-50000.0,4.190785595536497e-06,0.005816350794619784,True
+-25000.0,1.0230446685161828e-06,0.0010815184172356812,True

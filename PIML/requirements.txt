@@ -1,0 +1,5 @@
+# Keep this separate from the root requirements: CPU/GPU PyTorch installation
+# is platform-specific.  Install an appropriate PyTorch build first.
+torch>=2.0
+numpy>=2.0
+matplotlib>=3.0
